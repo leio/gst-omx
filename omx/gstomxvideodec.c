@@ -147,6 +147,7 @@ gst_omx_video_dec_init (GstOMXVideoDec * self)
   /* initially just try to use the decoder component alone */
   self->try_resizer = FALSE;
   self->use_resizer = FALSE;
+  self->resizer_padding_bottom = 0;
 #endif
 
   g_mutex_init (&self->drain_lock);
@@ -637,10 +638,45 @@ done:
 
 #if defined (USE_OMX_TARGET_RPI)
 static OMX_ERRORTYPE
+gst_omx_video_dec_set_resizer_params (GstOMXVideoDec * self,
+    const GstVideoInfo * info)
+{
+  OMX_ERRORTYPE err = OMX_ErrorNone;
+  OMX_PARAM_RESIZETYPE param;
+
+  g_return_val_if_fail (self, OMX_ErrorUndefined);
+  g_return_val_if_fail (self->res_out_port, OMX_ErrorUndefined);
+
+  GST_OMX_INIT_STRUCT (&param);
+
+  param.nPortIndex = self->res_out_port->index;
+  param.eMode = OMX_RESIZE_BOX;
+  param.nMaxWidth = GST_VIDEO_INFO_WIDTH (info);
+  param.nMaxHeight = GST_VIDEO_INFO_HEIGHT (info);
+  param.nMaxBytes = 0;
+  param.bAllowUpscaling = TRUE;
+  param.bPreserveAspectRatio = FALSE;
+
+  err =
+      gst_omx_component_set_parameter (self->resizer, OMX_IndexParamResize,
+      &param);
+
+  if (err != OMX_ErrorNone) {
+    GST_INFO_OBJECT (self, "Failed to set resize params: %s (0x%08x)",
+        gst_omx_error_to_string (err), err);
+    return err;
+  }
+
+  return OMX_ErrorNone;
+}
+
+static OMX_ERRORTYPE
 gst_omx_video_dec_set_resize_out_port (GstOMXVideoDec * self,
-    GstVideoInfo * info)
+    const GstVideoInfo * info)
 {
   GstOMXPort *port = NULL;
+  OMX_ERRORTYPE err = OMX_ErrorNone;
+
   g_return_val_if_fail (self, OMX_ErrorUndefined);
   g_return_val_if_fail (info, OMX_ErrorUndefined);
   g_return_val_if_fail (self->res_out_port, OMX_ErrorUndefined);
@@ -650,15 +686,22 @@ gst_omx_video_dec_set_resize_out_port (GstOMXVideoDec * self,
   port->port_def.format.image.eCompressionFormat = OMX_IMAGE_CodingUnused;
   port->port_def.format.image.eColorFormat = self->resize_color;
   port->port_def.format.image.nFrameWidth = GST_VIDEO_INFO_WIDTH (info);
-  /* resize only support height multiple of 16 */
   port->port_def.format.image.nFrameHeight =
-      GST_ROUND_UP_16 (GST_VIDEO_INFO_HEIGHT (info));
-  port->port_def.nBufferSize = GST_VIDEO_INFO_SIZE (info);
+      GST_VIDEO_INFO_HEIGHT (info) + self->resizer_padding_bottom;
   port->port_def.format.image.nStride = GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
   port->port_def.format.image.nSliceHeight = 0;
   port->port_def.format.image.bFlagErrorConcealment = OMX_FALSE;
 
-  return gst_omx_port_update_port_definition (port, &port->port_def);
+  err = gst_omx_port_update_port_definition (port, &port->port_def);
+  if (err != OMX_ErrorNone) {
+    GST_INFO_OBJECT (self, "Failed to set resizer output port: %s (0x%08x)",
+        gst_omx_error_to_string (err), err);
+    return err;
+  }
+
+  err = gst_omx_video_dec_set_resizer_params (self, info);
+
+  return err;
 }
 #endif
 
@@ -915,7 +958,7 @@ gst_omx_video_dec_allocate_output_buffers (GstOMXVideoDec * self)
     GST_DEBUG_OBJECT (self, "Trying to resize and use %d buffers", min);
 
     for (i = 0; i < min; i++) {
-      GstBuffer *buffer;
+      GstBuffer *buffer = NULL;
       GstMemory *mem = NULL;
       GstMapInfo info;
 
@@ -1184,8 +1227,8 @@ do_resize_done:
 
 #if defined (USE_OMX_TARGET_RPI)
     bufsize =
-        self->use_resizer ? self->res_out_port->port_def.
-        nBufferSize : self->dec_out_port->port_def.nBufferSize;
+        self->use_resizer ? self->res_out_port->port_def.nBufferSize : self->
+        dec_out_port->port_def.nBufferSize;
 #else
     bufsize = self->dec_out_port->port_def.nBufferSize;
 #endif
@@ -1468,6 +1511,8 @@ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
     } else {
       GstStructure *config = NULL;
       GstBufferPool *pool = NULL;
+      GstVideoInfo videoinfo;
+      gst_video_info_init (&videoinfo);
 
       /* Set up resize component */
       self->use_resizer = TRUE;
@@ -1478,9 +1523,14 @@ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
 
       GST_VIDEO_DECODER_STREAM_LOCK (self);
 
+      if (self->resize_width <= 0 || self->resize_height <= 0) {
+        self->resize_width = port_def.format.video.nFrameWidth;
+        self->resize_height = port_def.format.video.nFrameHeight;
+      }
+
       state = gst_video_decoder_set_output_state (GST_VIDEO_DECODER (self),
-          self->resize_format, port_def.format.video.nFrameWidth,
-          port_def.format.video.nFrameHeight, self->input_state);
+          self->resize_format, self->resize_width,
+          self->resize_height, self->input_state);
 
       if (!gst_video_decoder_negotiate (GST_VIDEO_DECODER (self))) {
         gst_video_codec_state_unref (state);
@@ -1499,15 +1549,15 @@ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
       /* resizer only support height been multiple of 16 */
       if (!gst_buffer_pool_config_has_option (config,
               GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT)
-          && port_def.format.video.nFrameHeight !=
-          GST_ROUND_UP_16 (port_def.format.video.nFrameHeight)) {
+          && self->resize_height != GST_ROUND_UP_16 (self->resize_height)) {
         GST_DEBUG_OBJECT (self, "negotiated pool do not support alignment");
+
+        self->resizer_padding_bottom = 0;
 
         /* use GST_ROUND_UP_16 this time */
         state = gst_video_decoder_set_output_state (GST_VIDEO_DECODER (self),
-            self->resize_format, port_def.format.video.nFrameWidth,
-            GST_ROUND_UP_16 (port_def.format.video.nFrameHeight),
-            self->input_state);
+            self->resize_format, self->resize_width,
+            GST_ROUND_UP_16 (self->resize_height), self->input_state);
 
         if (!gst_video_decoder_negotiate (GST_VIDEO_DECODER (self))) {
           gst_video_codec_state_unref (state);
@@ -1524,7 +1574,6 @@ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
       /* Now link it all together */
 
       GST_VIDEO_DECODER_STREAM_UNLOCK (self);
-
       err = gst_omx_port_set_enabled (self->res_in_port, FALSE);
       if (err != OMX_ErrorNone)
         goto no_res;
@@ -1598,7 +1647,6 @@ gst_omx_video_dec_reconfigure_output_port (GstOMXVideoDec * self)
       err = gst_omx_port_wait_enabled (self->dec_out_port, 1 * GST_SECOND);
       if (err != OMX_ErrorNone)
         goto no_res;
-
 
       err = gst_omx_port_mark_reconfigured (self->dec_out_port);
       if (err != OMX_ErrorNone)
@@ -2396,6 +2444,14 @@ gst_omx_video_dec_get_supported_image_colorformats (GstOMXVideoDec * self)
           GST_DEBUG_OBJECT (self, "Component supports ABGR (%d) at index %u",
               param.eColorFormat, (guint) param.nIndex);
           break;
+        case OMX_COLOR_Format32bitBGRA8888:
+          m = g_slice_new (GstOMXVideoNegotiationMap);
+          m->format = GST_VIDEO_FORMAT_BGRA;
+          m->type = param.eColorFormat;
+          negotiation_map = g_list_append (negotiation_map, m);
+          GST_DEBUG_OBJECT (self, "Component supports BGRA (%d) at index %u",
+              param.eColorFormat, (guint) param.nIndex);
+          break;
         default:
           GST_DEBUG_OBJECT (self,
               "Component supports unsupported color format %d at index %u",
@@ -2422,6 +2478,9 @@ gst_omx_video_dec_negotiate (GstOMXVideoDec * self)
   GstVideoFormat format;
   GstStructure *s;
   const gchar *format_str;
+  gboolean has_fixed_size = TRUE;
+  gint width = 0;
+  gint height = 0;
 
 #ifdef USE_OMX_TARGET_RPI
   GList *image_negotiation_map = NULL;
@@ -2493,6 +2552,12 @@ gst_omx_video_dec_negotiate (GstOMXVideoDec * self)
   }
 
   intersection = gst_caps_truncate (intersection);
+
+  /* retrieve fixed width and/or height set by downstream */
+  s = gst_caps_get_structure (intersection, 0);
+  has_fixed_size = gst_structure_get_int (s, "width", &width);
+  has_fixed_size &= gst_structure_get_int (s, "height", &height);
+
   intersection = gst_caps_fixate (intersection);
 
   GST_DEBUG_OBJECT (self, "fixated caps: %" GST_PTR_FORMAT, intersection);
@@ -2520,10 +2585,14 @@ gst_omx_video_dec_negotiate (GstOMXVideoDec * self)
     GstOMXVideoNegotiationMap *m = l->data;
 
     if (m->format == format) {
-      param_video.eColorFormat = m->type;
-      GST_DEBUG_OBJECT (self, "Negotiating color format %s (%d)", format_str,
-          param_video.eColorFormat);
-      break;
+      if (!has_fixed_size) {
+        param_video.eColorFormat = m->type;
+        GST_DEBUG_OBJECT (self, "Negotiating color format %s (%d)", format_str,
+            param_video.eColorFormat);
+        break;
+      } else {
+        GST_DEBUG_OBJECT (self, "Had the right format but not the size");
+      }
     }
   }
 
@@ -2569,6 +2638,14 @@ gst_omx_video_dec_negotiate (GstOMXVideoDec * self)
 
     self->resize_color = param_image.eColorFormat;
     self->resize_format = format;
+    if (has_fixed_size) {
+      self->resize_width = width;
+      self->resize_height = height;
+    } else {
+      /* get width height from decoder later */
+      self->resize_width = 0;
+      self->resize_height = 0;
+    }
   } else {
 #endif
     err =
@@ -3460,7 +3537,27 @@ gst_omx_video_dec_decide_allocation (GstVideoDecoder * bdec, GstQuery * query)
       if (caps && gst_video_info_from_caps (&info, caps)) {
         gst_buffer_pool_config_add_option (config,
             GST_BUFFER_POOL_OPTION_VIDEO_ALIGNMENT);
-        align.padding_bottom = GST_ROUND_UP_16 (GST_VIDEO_INFO_HEIGHT (&info));
+
+        if (GST_ROUND_UP_16 (self->dec_out_port->port_def.format.
+                video.nFrameHeight) >
+            self->dec_out_port->port_def.format.video.nFrameHeight) {
+          /* minimun padding for resizer to work if it actually does scaling */
+          gint min_diff = 8;
+          if ((GST_ROUND_UP_16 (GST_VIDEO_INFO_HEIGHT (&info)) -
+                  GST_VIDEO_INFO_HEIGHT (&info)) < min_diff)
+            self->resizer_padding_bottom =
+                GST_ROUND_UP_16 (GST_VIDEO_INFO_HEIGHT (&info) + min_diff) -
+                GST_VIDEO_INFO_HEIGHT (&info);
+          else
+            self->resizer_padding_bottom =
+                GST_ROUND_UP_16 (GST_VIDEO_INFO_HEIGHT (&info)) -
+                GST_VIDEO_INFO_HEIGHT (&info);
+        }
+
+        GST_DEBUG_OBJECT (self, "resizer bottom padding: %d",
+            self->resizer_padding_bottom);
+
+        align.padding_bottom = self->resizer_padding_bottom;
         gst_buffer_pool_config_set_video_alignment (config, &align);
       }
     }
